@@ -240,3 +240,6 @@ python .backfill_resume_12m.py
 
 단점: 최근 180일도 “휙” 다시 훑긴 함(금방 스킵되긴 함).
 
+# 레포 루트에서 실행 (현재 위치 OK)
+docker compose -f docker/docker-compose.yml up -d db
+docker compose -f docker/docker-compose.yml ps
