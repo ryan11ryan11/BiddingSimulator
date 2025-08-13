@@ -1,39 +1,80 @@
-from typing import Any, Dict, List, Optional
+# apps/etl/tasks.py
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
+import time
+
 from core.config import settings
 from core.clients.bid_public_info import BidPublicInfo
 from core.clients.scsbid_info import ScsbidInfo
-from core.db.dao import upsert_notice, upsert_result, upsert_prep15_bulk
-import time
+from core.db.dao import (
+    upsert_notice,
+    upsert_result,
+    upsert_prep15_bulk,
+)
 
+# -------------------------------------------------------------------
+# Clients
+# -------------------------------------------------------------------
 bp = BidPublicInfo(settings.bid_public_base, settings.service_key)
 sc = ScsbidInfo(settings.scsbid_base, settings.service_key)
 
-# -------------------------
-# Generic JSON helpers
-# -------------------------
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+def _first(d: Dict, names: List[str], default=None):
+    for k in names:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return default
 
-def _paged_get(client, path, base_params, page_size=100):
+def _ensure_list(x: Any) -> List[Dict]:
+    """
+    나라장터 OpenAPI에서 흔한 구조:
+    {response:{body:{items:{item: [...]}}}}
+    위/변형들을 전부 안전하게 리스트로 펴 준다.
+    """
+    if isinstance(x, list):
+        return x
+    if isinstance(x, dict):
+        if "item" in x:
+            v = x["item"]
+            return v if isinstance(v, list) else ([v] if v else [])
+        body = x.get("response", {}).get("body", {})
+        items = body.get("items")
+        if items is not None:
+            return _ensure_list(items)
+    return []
+
+def _paged_get(client, path: str, base_params: Dict, page_size: int = 100):
+    """
+    공통 페이지네이터: 각 페이지의 resp, total, page를 yield
+    """
     page = 1
     total = None
     while True:
         params = dict(base_params, pageNo=page, numOfRows=page_size)
         resp = client.get(path, params)
         body = (resp or {}).get("response", {}).get("body", {})
-        total = int(body.get("totalCount") or 0) if total is None else total
+        if total is None:
+            total = int(body.get("totalCount") or 0)
         yield resp, total, page
-        # 다음 페이지 결정
-        if page * page_size >= total:
+        if page * page_size >= (total or 0):
             break
         page += 1
         time.sleep(0.2)  # soft throttle
 
+# -------------------------------------------------------------------
+# Fetch "basis amount / range" map for Cnstwk (한 번에)
+# -------------------------------------------------------------------
 def fetch_bsis_map_cnstwk(bgn: str, end: str) -> Dict[tuple, dict]:
     """
-    getBidPblancListInfoCnstwkBsisAmount (inqryDiv=1, 기간 조회) 를 페이지 돌며
-    {(bid_no, ord): {"base":..., "low":..., "high":...}} 맵으로 만든다.
+    getBidPblancListInfoCnstwkBsisAmount (inqryDiv=1, 기간 조회) 페이지 순회
+    -> {(bid_no, ord): {"base":..., "low":..., "high":...}}
     """
-    m = {}
+    m: Dict[Tuple[str, str], Dict[str, Optional[float]]] = {}
+
     for resp, total, page in _paged_get(
         bp,
         "getBidPblancListInfoCnstwkBsisAmount",
@@ -50,72 +91,58 @@ def fetch_bsis_map_cnstwk(bgn: str, end: str) -> Dict[tuple, dict]:
                 base = 0
             low  = _first(it, ["plnprcEsttRngBgnRate", "rsrvtnPrceRngBgnRate", "rngBgnRate"])
             high = _first(it, ["plnprcEsttRngEndRate", "rsrvtnPrceRngEndRate", "rngEndRate"])
+
             def _to_pct(x):
-                if x is None: return None
-                x = float(str(x).replace("%",""))
-                return x/100.0 if abs(x)>1 else x
+                if x is None:
+                    return None
+                x = float(str(x).replace("%", ""))
+                return x / 100.0 if abs(x) > 1 else x
+
             m[(bid_no, ord_)] = {"base": base, "low": _to_pct(low), "high": _to_pct(high)}
-        # (선택) 진행 로그
-        # print(f"[bsis] page={page} / total~{total}")
+
         time.sleep(0.2)  # soft throttle
+
     return m
 
-
-def _first(d: Dict, names: List[str], default=None):
-    for k in names:
-        if k in d and d[k] not in (None, ""):
-            return d[k]
-    return default
-
-
-def _ensure_list(x: Any) -> List[Dict]:
-    # 나라장터 OpenAPI는 {response:{body:{items:{item:[]}}}} 패턴이 흔함
-    if isinstance(x, list):
-        return x
-    if isinstance(x, dict):
-        if "item" in x:
-            v = x["item"]
-            return v if isinstance(v, list) else [v]
-        # body/items/item 형태 탐색
-        body = x.get("response", {}).get("body", {})
-        items = body.get("items")
-        if items is not None:
-            return _ensure_list(items)
-    return []
-
-
-# -------------------------
+# -------------------------------------------------------------------
 # Parsers
-# -------------------------
-
+# -------------------------------------------------------------------
 def parse_notice_items(resp: Dict, work_type_hint: str) -> List[Dict]:
-    out = []
+    """
+    공고 리스트 파서
+    """
+    out: List[Dict] = []
     for it in _ensure_list(resp):
         bid_no = str(_first(it, ["bidNtceNo", "BIDNTCENO", "bidNo"]))
         ord_ = str(_first(it, ["bidNtceOrd", "BIDNTCEORD", "bidOrd", "ntceOrd"], "1"))
+
         base = _first(it, ["bssAmt", "bssamt", "baseAmt", "BIDBSSAMT"]) or 0
         try:
             base = int(str(base).replace(",", ""))
         except Exception:
             base = 0
-        # 예정가격 범위(±a%)
-        low = _first(it, ["plnprcEsttRngBgnRate", "rsrvtnPrceRngBgnRate", "rngBgnRate"])  # 예: -2
-        high = _first(it, ["plnprcEsttRngEndRate", "rsrvtnPrceRngEndRate", "rngEndRate"])  # 예: +2
+
+        low = _first(it, ["plnprcEsttRngBgnRate", "rsrvtnPrceRngBgnRate", "rngBgnRate"])
+        high = _first(it, ["plnprcEsttRngEndRate", "rsrvtnPrceRngEndRate", "rngEndRate"])
+
         def _to_pct(x):
-            if x is None: return None
+            if x is None:
+                return None
             x = float(str(x).replace("%", ""))
-            return x / 100.0 if abs(x) > 1 else x  # 2 → 0.02, 0.02 유지
+            return x / 100.0 if abs(x) > 1 else x
+
         range_low = _to_pct(low)
         range_high = _to_pct(high)
 
         owner_id = str(_first(it, ["dminsttCd", "asignBdgtInsttCd", "insttCd", "ownerId"]) or "")
-        announced_at = _first(it, ["bidNtceDt", "ntceDt", "rgstDt"])  # YYYYMMDDHHMM 형태
+        announced_at = _first(it, ["bidNtceDt", "ntceDt", "rgstDt"])  # YYYYMMDDHHMM or YYYYMMDD
         if announced_at:
             try:
-                if len(str(announced_at)) == 12:
-                    announced_at = datetime.strptime(str(announced_at), "%Y%m%d%H%M")
+                s = str(announced_at)
+                if len(s) == 12:
+                    announced_at = datetime.strptime(s, "%Y%m%d%H%M")
                 else:
-                    announced_at = datetime.strptime(str(announced_at)[:8], "%Y%m%d")
+                    announced_at = datetime.strptime(s[:8], "%Y%m%d")
             except Exception:
                 announced_at = None
 
@@ -135,41 +162,11 @@ def parse_notice_items(resp: Dict, work_type_hint: str) -> List[Dict]:
             out.append(row)
     return out
 
-
-# def parse_prepar_detail_items(resp: Dict) -> Dict[str, List[Dict]]:
-#     # returns mapping key (bid_no, ord) -> rows[prep15]
-#     m: Dict[str, List[Dict]] = {}
-#     for it in _ensure_list(resp):
-#         bid_no = str(_first(it, ["bidNtceNo", "bidNo", "BIDNTCENO"]))
-#         ord_ = str(_first(it, ["bidNtceOrd", "bidOrd", "BIDNTCEORD"], "1"))
-#         comp_sno = int(_first(it, ["compSno", "compno", "rsrvtnPrceSno", "sno"], 0))
-#         bsis_plnprc = _first(it, ["bsisPlnprc", "rsrvtnPrce", "bsisPlnprcAmt", "rsrvtnAmt"], 0)
-#         plnprc_final = _first(it, ["plnprc", "finalPlnprc", "fnlPlnprc"], None)
-#         drawn_yn = str(_first(it, ["drwtYn", "drawYn"], "N")).upper() == "Y"
-#         drwt_seq = _first(it, ["drwtNum", "drwtOrdr", "drawSeq"], None)
-#         # normalize ints
-#         def _to_int(x):
-#             try:
-#                 return int(str(x).replace(",", "")) if x is not None else None
-#             except Exception:
-#                 return None
-#         row = {
-#             "bid_no": bid_no,
-#             "ord": ord_,
-#             "comp_sno": comp_sno,
-#             "bsis_plnprc": _to_int(bsis_plnprc) or 0,
-#             "drawn_flag": drawn_yn,
-#             "draw_seq": int(drwt_seq) if drwt_seq is not None else None,
-#             "final_plnprc": _to_int(plnprc_final),
-#         }
-#         if bid_no and comp_sno:
-#             m.setdefault(f"{bid_no}|{ord_}", []).append(row)
-#     return m
-
 def parse_prepar_detail_items(resp: Dict) -> Dict[str, List[Dict]]:
     """
+    예비가격상세(prep15) 파서
     returns mapping: "{bid_no}|{ord}" -> List[rows]
-    키 변형/대소문자 차이를 최대한 흡수하고, comp_sno가 누락될 경우 순번을 유추해 채운다.
+    comp_sno(항목 순번) 누락 시 공고 내에서 1..N을 유추해 채움
     """
     def _to_int(x):
         try:
@@ -179,19 +176,16 @@ def parse_prepar_detail_items(resp: Dict) -> Dict[str, List[Dict]]:
 
     m: Dict[str, List[Dict]] = {}
 
-    # items 찾아내기 (response/body/items/item 패턴/변형 모두 커버)
     items = _ensure_list(resp)
     if not items:
         body = (resp or {}).get("response", {}).get("body", {})
         items = _ensure_list(body.get("items", {}))
     if not items:
-        return m  # 이 페이지는 데이터 없음
+        return m
 
     for it in items:
-        # 키를 소문자로 통일
         low = {str(k).lower(): v for k, v in it.items()}
 
-        # 필드 매핑(여러 별칭 대응)
         bid_no = str(
             low.get("bidntceno") or low.get("bidno") or low.get("bid_ntce_no") or low.get("bidnotice_no") or ""
         ).strip()
@@ -199,9 +193,7 @@ def parse_prepar_detail_items(resp: Dict) -> Dict[str, List[Dict]]:
             low.get("bidntceord") or low.get("bidord") or low.get("ntceord") or low.get("bid_ntce_ord") or "1"
         ).strip()
 
-        comp_sno = (
-            low.get("compsno") or low.get("compno") or low.get("rsrvtnprcesno") or low.get("sno")
-        )
+        comp_sno = low.get("compsno") or low.get("compno") or low.get("rsrvtnprcesno") or low.get("sno")
         comp_sno = _to_int(comp_sno)
 
         bsis_plnprc = (
@@ -227,46 +219,71 @@ def parse_prepar_detail_items(resp: Dict) -> Dict[str, List[Dict]]:
             continue
 
         key = f"{row['bid_no']}|{row['ord']}"
-        # comp_sno가 없다면, 해당 공고 안에서 1부터 순차 부여
         if row["comp_sno"] is None or row["comp_sno"] <= 0:
             row["comp_sno"] = len(m.get(key, [])) + 1
 
-        # 최종 append
         m.setdefault(key, []).append(row)
 
     return m
 
+def parse_result_items(resp: Dict) -> List[Dict]:
+    """
+    개찰결과(result) 파서: 예정가격(est_price), 예비가격평균(presmpt_price) 등
+    """
+    def _to_int_or_none(x):
+        try:
+            return int(str(x).replace(",", ""))
+        except Exception:
+            return None
 
+    out: List[Dict] = []
 
-# -------------------------
+    items = _ensure_list(resp)
+    if not items:
+        body = (resp or {}).get("response", {}).get("body", {})
+        items = _ensure_list(body.get("items", {}))
+    if not items:
+        return out
+
+    for it in items:
+        # 다양한 키 별칭 흡수
+        bid_no = str(_first(it, ["bidNtceNo", "bidNo", "BIDNTCENO"]))
+        ord_   = str(_first(it, ["bidNtceOrd", "bidOrd", "BIDNTCEORD"], "1"))
+
+        est    = _to_int_or_none(_first(it, ["estmtPrice","estPrice","prdprc","EPRC","esttPric","esttAmt"]))
+        prcmp  = _to_int_or_none(_first(it, ["presmptPrce","presmptPrice","PRCMP","prsmptPrc"]))
+        cnt    = _to_int_or_none(_first(it, ["opengBddprcnt","bidderCnt","BIDDERCNT"]))
+        rebid  = str(_first(it, ["rbidYn","reBidYn","REBDYN"], "N")).upper() == "Y"
+        rldt   = _first(it, ["rlOpengDt","opengDt","OPENGDT"])  # YYYYMMDDHHMM
+
+        row = {
+            "bid_no": bid_no,
+            "ord": ord_,
+            "est_price": est,
+            "presmpt_price": prcmp,
+            "bidders_cnt": cnt,
+            "rebid_flag": rebid,
+            "rl_openg_dt": None,
+        }
+        # 날짜 파싱(있을 때만)
+        if isinstance(rldt, str) and len(rldt) == 12:
+            try:
+                row["rl_openg_dt"] = datetime.strptime(rldt, "%Y%m%d%H%M")
+            except Exception:
+                pass
+
+        if bid_no:
+            out.append(row)
+
+    return out
+
+# -------------------------------------------------------------------
 # Extract → Transform → Load
-# -------------------------
-
-# def collect_and_load_prepar_detail_cnstwk(bgn: str, end: str) -> int:
-#     page = 1
-#     saved = 0
-#     page_size = 100
-#     while True:
-#         resp = sc.get_prepar_pc_detail_cnstwk(
-#             inqry_div=1, inqry_bgn_dt=bgn, inqry_end_dt=end, page_no=page, num_rows=page_size
-#         )
-#         body = (resp or {}).get("response",{}).get("body",{})
-#         total = int(body.get("totalCount") or 0)
-
-#         m = parse_prepar_detail_items(resp)
-#         if not m:
-#             break
-#         for _, rows in m.items():
-#             upsert_prep15_bulk(rows)
-#             saved += len(rows)
-
-#         if page * page_size >= total:
-#             break
-#         page += 1
-#     return saved
-
-# --- 교체 대상: apps/etl/tasks.py 안의 collect_and_load_prepar_detail_cnstwk 함수 전체를 이걸로 바꿔주세요 ---
+# -------------------------------------------------------------------
 def collect_and_load_prepar_detail_cnstwk(bgn: str, end: str) -> int:
+    """
+    예비가격상세(prep15) 수집 → t_prep15 벌크 upsert
+    """
     page = 1
     saved = 0
     page_size = 100
@@ -282,42 +299,23 @@ def collect_and_load_prepar_detail_cnstwk(bgn: str, end: str) -> int:
             for _, rows in m.items():
                 upsert_prep15_bulk(rows)
                 saved += len(rows)
-        # 비어 있어도 다음 페이지로 계속 감
+
         if page * page_size >= total:
             break
         page += 1
-        time.sleep(0.3)  # 호출한도 완화
+        time.sleep(0.3)  # 호출 한도 여유
     return saved
 
-
-def _fetch_bsis_amount_for_cnstwk(bid_no: str, bid_ord: str = "1"):
-    res = bp.get("getBidPblancListInfoCnstwkBsisAmount", {
-        "inqryDiv": 2,           # 1:등록일시 / 2:공고번호
-        "bidNtceNo": bid_no,
-        "bidNtceOrd": bid_ord,   # ★ 추가
-        "pageNo": 1,
-        "numOfRows": 10,
-    })
-    items = _ensure_list(res) or _ensure_list((res or {}).get("response",{}).get("body",{}).get("items",{}))
-    if not items:
-        return None
-    it = items[0]
-    base = int(str(_first(it, ["bssAmt","bssamt","baseAmt"], 0)).replace(",",""))
-    low  = _first(it, ["plnprcEsttRngBgnRate","rsrvtnPrceRngBgnRate","rngBgnRate"])
-    high = _first(it, ["plnprcEsttRngEndRate","rsrvtnPrceRngEndRate","rngEndRate"])
-    def _to_pct(x):
-        if x is None: return None
-        x = float(str(x).replace("%",""))
-        return x/100.0 if abs(x)>1 else x
-    return base, _to_pct(low), _to_pct(high)
-
-# 2) 공고 수집: 페이징 + bsis 맵 조인 (per-bid 호출 제거)
-def collect_and_load_notices(bgn: str, end: str, work: str = "Cnstwk"):
+def collect_and_load_notices(bgn: str, end: str, work: str = "Cnstwk") -> int:
+    """
+    공고 수집: 기간 윈도우로 공고 리스트를 받고,
+    같은 윈도우의 '기초금액/범위' 맵을 한 번에 불러 보강 후 t_notice upsert
+    """
     if work != "Cnstwk":
-        # 다른 업무는 동일 패턴으로 함수 하나 더 만들어 쓰세요 (Servc/Thng/Frgcpt)
+        # TODO: 필요 시 Servc/Thng/Frgcpt 버전 추가
         pass
 
-    bsis_map = fetch_bsis_map_cnstwk(bgn, end)  # ★ 윈도우 단위로 한 번에 확보
+    bsis_map = fetch_bsis_map_cnstwk(bgn, end)  # 윈도우 단위로 한 번에 확보
     saved = 0
 
     for resp, total, page in _paged_get(
@@ -328,21 +326,71 @@ def collect_and_load_notices(bgn: str, end: str, work: str = "Cnstwk"):
     ):
         rows = parse_notice_items(resp, work_type_hint=work)
 
-        fixed = []
         for r in rows:
             if not r["base_amount"]:
                 hit = bsis_map.get((r["bid_no"], r["ord"]))
                 if hit and hit["base"]:
                     r["base_amount"] = hit["base"]
-                    if hit["low"] is not None:  r["range_low"] = hit["low"]
-                    if hit["high"] is not None: r["range_high"] = hit["high"]
+                    if hit["low"] is not None:
+                        r["range_low"] = hit["low"]
+                    if hit["high"] is not None:
+                        r["range_high"] = hit["high"]
             if r["bid_no"] and r["base_amount"]:
-                upsert_notice(r); fixed.append(r)
+                upsert_notice(r)
+                saved += 1
 
-        saved += len(fixed)
-        # (선택) 진행 로그
-        # print(f"[list] page={page} / total~{total} parsed={len(rows)} saved+={len(fixed)}")
         time.sleep(0.2)  # soft throttle
 
-    # print(f"[done] notices saved={saved}")
     return saved
+
+def collect_and_load_results_cnstwk(bgn: str, end: str, page_size: int = 100) -> int:
+    """
+    개찰결과(result) 수집 → t_result upsert
+    """
+    saved = 0
+    page = 1
+    while True:
+        # inqry_div=1 : 등록일시 기간 필터
+        resp = sc.get_openg_result_list_cnstwk(
+            inqry_div=1, inqry_bgn_dt=bgn, inqry_end_dt=end, page_no=page, num_rows=page_size
+        )
+        body = (resp or {}).get("response", {}).get("body", {})
+        total = int(body.get("totalCount") or 0)
+
+        rows = parse_result_items(resp)
+        if not rows:
+            # 데이터가 없더라도 total 기준으로 마지막 페이지까지는 시도
+            if page * page_size >= total:
+                break
+        else:
+            for r in rows:
+                upsert_result(r)
+            saved += len(rows)
+
+        if page * page_size >= total:
+            break
+        page += 1
+        time.sleep(0.2)
+    return saved
+
+# (옵션) 단일 공고의 기초금액/범위만 직접 조회할 때 사용할 수 있는 유틸
+def _fetch_bsis_amount_for_cnstwk(bid_no: str, bid_ord: str = "1") -> Optional[Tuple[int, Optional[float], Optional[float]]]:
+    res = bp.get(
+        "getBidPblancListInfoCnstwkBsisAmount",
+        {"inqryDiv": 2, "bidNtceNo": bid_no, "bidNtceOrd": bid_ord, "pageNo": 1, "numOfRows": 10},
+    )
+    items = _ensure_list(res) or _ensure_list((res or {}).get("response", {}).get("body", {}).get("items", {}))
+    if not items:
+        return None
+    it = items[0]
+    base = int(str(_first(it, ["bssAmt", "bssamt", "baseAmt"], 0)).replace(",", ""))
+    low = _first(it, ["plnprcEsttRngBgnRate", "rsrvtnPrceRngBgnRate", "rngBgnRate"])
+    high = _first(it, ["plnprcEsttRngEndRate", "rsrvtnPrceRngEndRate", "rngEndRate"])
+
+    def _to_pct(x):
+        if x is None:
+            return None
+        x = float(str(x).replace("%", ""))
+        return x / 100.0 if abs(x) > 1 else x
+
+    return base, _to_pct(low), _to_pct(high)
