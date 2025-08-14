@@ -243,3 +243,8 @@ python .backfill_resume_12m.py
 # 레포 루트에서 실행 (현재 위치 OK)
 docker compose -f docker/docker-compose.yml up -d db
 docker compose -f docker/docker-compose.yml ps
+
+# 백필온리 실행할때 이거 한번만 실행해줌
+$env:PYTHONPATH = (Resolve-Path .).Path
+python .\scripts\backfill_results_only.py
+

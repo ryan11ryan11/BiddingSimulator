@@ -14,6 +14,8 @@ from core.db.dao import (
     upsert_prep15_bulk,
 )
 
+from prefect import get_run_logger
+
 # -------------------------------------------------------------------
 # Clients
 # -------------------------------------------------------------------
@@ -287,6 +289,7 @@ def collect_and_load_prepar_detail_cnstwk(bgn: str, end: str) -> int:
     page = 1
     saved = 0
     page_size = 100
+    log = _logger()
     while True:
         resp = sc.get_prepar_pc_detail_cnstwk(
             inqry_div=1, inqry_bgn_dt=bgn, inqry_end_dt=end, page_no=page, num_rows=page_size
@@ -304,6 +307,7 @@ def collect_and_load_prepar_detail_cnstwk(bgn: str, end: str) -> int:
             break
         page += 1
         time.sleep(0.3)  # 호출 한도 여유
+    log.info(f"[PREP15] window {bgn}~{end} done, saved={saved}")
     return saved
 
 def collect_and_load_notices(bgn: str, end: str, work: str = "Cnstwk") -> int:
@@ -311,6 +315,7 @@ def collect_and_load_notices(bgn: str, end: str, work: str = "Cnstwk") -> int:
     공고 수집: 기간 윈도우로 공고 리스트를 받고,
     같은 윈도우의 '기초금액/범위' 맵을 한 번에 불러 보강 후 t_notice upsert
     """
+    log = _logger()
     if work != "Cnstwk":
         # TODO: 필요 시 Servc/Thng/Frgcpt 버전 추가
         pass
@@ -340,7 +345,7 @@ def collect_and_load_notices(bgn: str, end: str, work: str = "Cnstwk") -> int:
                 saved += 1
 
         time.sleep(0.2)  # soft throttle
-
+    log.info(f"Collected {saved} notices from {bgn} to {end}")
     return saved
 
 def collect_and_load_results_cnstwk(bgn: str, end: str, page_size: int = 100) -> int:
@@ -349,6 +354,7 @@ def collect_and_load_results_cnstwk(bgn: str, end: str, page_size: int = 100) ->
     """
     saved = 0
     page = 1
+    log = _logger()
     while True:
         # inqry_div=1 : 등록일시 기간 필터
         resp = sc.get_openg_result_list_cnstwk(
@@ -371,6 +377,7 @@ def collect_and_load_results_cnstwk(bgn: str, end: str, page_size: int = 100) ->
             break
         page += 1
         time.sleep(0.2)
+    log.info(f"[RESULT] window {bgn}~{end} done, saved={saved}")
     return saved
 
 # (옵션) 단일 공고의 기초금액/범위만 직접 조회할 때 사용할 수 있는 유틸
@@ -394,3 +401,15 @@ def _fetch_bsis_amount_for_cnstwk(bid_no: str, bid_ord: str = "1") -> Optional[T
         return x / 100.0 if abs(x) > 1 else x
 
     return base, _to_pct(low), _to_pct(high)
+
+def _logger():
+    try:
+        return get_run_logger()
+    except Exception:
+        import logging, sys
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            stream=sys.stdout,
+        )
+        return logging.getLogger("etl")
