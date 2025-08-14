@@ -28,21 +28,47 @@ def upsert_notice(row: Dict):
         conn.execute(sql, row)
 
 
-def upsert_result(row: Dict):
-    sql = text(
-        """
-        INSERT INTO t_result(bid_no, ord, est_price, presmpt_price, bidders_cnt, rebid_flag, rl_openg_dt)
-        VALUES (:bid_no, :ord, :est_price, :presmpt_price, :bidders_cnt, :rebid_flag, :rl_openg_dt)
-        ON CONFLICT (bid_no, ord) DO UPDATE SET
-          est_price=EXCLUDED.est_price,
-          presmpt_price=EXCLUDED.presmpt_price,
-          bidders_cnt=EXCLUDED.bidders_cnt,
-          rebid_flag=EXCLUDED.rebid_flag,
-          rl_openg_dt=EXCLUDED.rl_openg_dt;
-        """
+def upsert_result(row: dict):
+    """
+    t_result UPSERT
+    - 새 값이 NULL이면 기존 값을 유지(COALESCE).
+    """
+    sql = text("""
+    INSERT INTO t_result (
+        bid_no, ord,
+        est_price,
+        presmpt_price,
+        bidders_cnt,
+        rebid_flag,
+        rl_openg_dt,
+        updated_at
+    ) VALUES (
+        :bid_no, :ord,
+        :est_price,
+        :presmpt_price,
+        :bidders_cnt,
+        :rebid_flag,
+        :rl_openg_dt,
+        now()
     )
+    ON CONFLICT (bid_no, ord) DO UPDATE SET
+        est_price     = COALESCE(EXCLUDED.est_price,     t_result.est_price),
+        presmpt_price = COALESCE(EXCLUDED.presmpt_price, t_result.presmpt_price),
+        bidders_cnt   = COALESCE(EXCLUDED.bidders_cnt,   t_result.bidders_cnt),
+        rebid_flag    = COALESCE(EXCLUDED.rebid_flag,    t_result.rebid_flag),
+        rl_openg_dt   = COALESCE(EXCLUDED.rl_openg_dt,   t_result.rl_openg_dt),
+        updated_at    = now();
+    """)
     with engine.begin() as conn:
-        conn.execute(sql, row)
+        conn.execute(sql, {
+            "bid_no": row.get("bid_no"),
+            "ord": row.get("ord"),
+            "est_price": row.get("est_price"),
+            "presmpt_price": row.get("presmpt_price"),
+            "bidders_cnt": row.get("bidders_cnt"),
+            "rebid_flag": row.get("rebid_flag"),
+            "rl_openg_dt": row.get("rl_openg_dt"),
+        })
 
 
 def upsert_prep15_bulk(rows: List[Dict]):
