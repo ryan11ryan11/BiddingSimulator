@@ -248,3 +248,64 @@ docker compose -f docker/docker-compose.yml ps
 $env:PYTHONPATH = (Resolve-Path .).Path
 python .\scripts\backfill_results_only.py
 
+
+
+postgresql://user@localhost:5432/eest
+
+user= user ; pass= pass
+
+DBEAVER
+
+
+ venv 활성화
+.\.venv\Scripts\Activate.ps1
+
+ venv 활성화
+.\.venv\Scripts\Activate.ps1
+
+ venv 활성화
+.\.venv\Scripts\Activate.ps1
+
+
+$env:G2B_SERVICE_KEY="x/PZ/5P4XEADwenpLZQj+gcF1SinSHLzZa+waIRUNBDmOq2fVux+tTXi2ZReHBpKtKWQnHNqvmgfR2APKc3PKg=="
+py g2b_pipeline_two_stage.py --from 20250101 --to 20250131
+
+조건에 맞는(3억이하 금속창업)것만 받아온다 
+py collectDaya.py --from 20250101 --to 20250131
+
+프렙 받기 <후보에서만 받는다.> 위 조건에 맞는 애들거만 가져온다.
+py collectDaya.py --from 20250101 --to 20250131 --prep-from-cands
+
+디버그 메세지 포함함
+python collectData.py --from 20250101 --to 20250130 --debug
+
+
+$env:PG_DSN="postgresql+psycopg2://bs:bs_pw@localhost:5432/biddingsim"
+
+python collectData.py `
+  --from 20250101 --to 20250131 `
+  --per-page 200 --license-lookback-days 60 `
+  --debug
+
+$env:PG_DSN="postgresql+psycopg2://user:pass@localhost:5432/postgres"
+
+.\.venv\Scripts\python.exe .\collectData.py `
+  --from 20250101 --to 20250131 `
+  --license-lookback-days 365 `
+  --single-backfill-cap 300 `
+  --use-std-dataset `
+  --debug
+
+
+
+collectall
+
+.\.venv\Scripts\python.exe .\collectData_optimized.py `
+  --from 20250101 --to 20250131 `
+  --license-lookback-days 365 `
+  --single-backfill-cap 800 `
+  --scope all `
+  --exclude-cntrct 단가 수의 유지보수 `
+  --use-std-dataset `
+  --create-views `
+  --debug
